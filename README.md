@@ -9,3 +9,13 @@ Tabs:
 - System: presets, transition, nightlight, UDP sync, device info, web UI, reboot.
 
 Install: copy the `WLED Control` folder to `Documents\Rainmeter\Skins`, refresh Rainmeter, load `Main\WLED.ini`.
+
+## Screenshots
+
+| Colours | Effects |
+| --- | --- |
+| <img src="screenshots/colours.png" alt="WLED Control colours tab" width="280"> | <img src="screenshots/effects.png" alt="WLED Control effects tab with per-effect controls" width="280"> |
+
+| Segments | System |
+| --- | --- |
+| <img src="screenshots/segments.png" alt="WLED Control segments tab" width="280"> | <img src="screenshots/system.png" alt="WLED Control system tab" width="280"> |
