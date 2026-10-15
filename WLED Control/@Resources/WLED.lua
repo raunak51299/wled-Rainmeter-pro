@@ -4,13 +4,20 @@ local fxNames, palNames, fxdata, presetNames, presetIds = {}, {}, {}, {}, {}
 local devices, devIdx, scanning = {}, 1, false
 local S = nil                       -- decoded { state = ..., info = ... }
 local selSeg, slot, page = 1, 1, 1
-local holdUntil, postN, rbArm = 0, 0, 0
+local rbArm = 0
 local lastRaw = {}
 local hasW, hasCct = false, false
 local hsvMem = nil
 local ROWS, TRACK_H = 14, 336
+local MAX_QUEUED_POSTS = 32
 local picker = { mode = nil, offset = 0 }
 local cache, dirty = {}, false
+local postQueue, postInFlight, postSequence = {}, nil, 0
+local postSession = ''
+local scanStatus = 'Ready'
+local requestFailed = false
+local scanStarted = nil
+local dispatchPost, pollPostResult, refreshState
 
 -- ------------------------------------------------------------- helpers
 local function setVar(k, v)
@@ -43,6 +50,39 @@ local function round(v) return math.floor(v + 0.5) end
 local function toByte(pct) return round(clamp(pct, 0, 100) * 2.55) end
 local function ip() return SKIN:GetVariable('IP') or '' end
 local function bool(v) return v and 'true' or 'false' end
+
+local function showStatus(text, failed)
+  scanStatus = text
+  if failed ~= nil then requestFailed = failed end
+  setVar('StatusText', text)
+  redraw()
+end
+
+local function normalizeAddress(value)
+  if type(value) ~= 'string' then return nil end
+  local address = value:gsub('^%s+', ''):gsub('%s+$', ''):lower()
+  if address == '' or #address > 253 then return nil end
+
+  local a, b, c, d = address:match('^(%d+)%.(%d+)%.(%d+)%.(%d+)$')
+  if a then
+    local octets = {}
+    for _, octet in ipairs({ a, b, c, d }) do
+      local number = tonumber(octet)
+      if not number or number > 255 then return nil end
+      octets[#octets + 1] = tostring(number)
+    end
+    return table.concat(octets, '.')
+  end
+  if address:match('^[%d%.]+$') or address:sub(1, 1) == '.' or
+    address:sub(-1) == '.' or address:find('%.%.') then return nil end
+
+  for label in address:gmatch('[^.]+') do
+    if #label > 63 or not label:match('^[a-z0-9%-]+$') or
+      label:sub(1, 1) == '-' or label:sub(-1) == '-' then return nil end
+  end
+  if address:find('[^a-z0-9%.%-]') then return nil end
+  return address
+end
 
 local function utf8enc(c)
   if c < 128 then return string.char(c) end
@@ -202,6 +242,8 @@ local function meta(id)
     if x and x ~= '' then m.col[i] = (x == '!') and COLN[i] or x end
   end
   m.pal = (p[3] or '') ~= ''
+  local defaultPal = (p[5] or ''):match('pal=(%d+)')
+  if defaultPal then m.defaultPal = tonumber(defaultPal) end
   return m
 end
 
@@ -353,6 +395,10 @@ function Render()
   setVar('PowerCol', st.on and '0,150,255' or '90,90,110')
   setVar('Name', info.name or 'WLED')
   setVar('Sub', ip() .. '  -  v' .. (info.ver or '?') .. '  -  ' .. count .. ' LEDs')
+  if not requestFailed and not scanning and scanStatus == 'Connecting...' then
+    scanStatus = 'Connected'
+  end
+  setVar('StatusText', scanStatus)
   setVar('Fbri', clamp((st.bri or 0) / 255, 0, 1))
   setVar('TxtBri', 'BRIGHTNESS  ' .. (st.bri or 0) .. ' / 255')
 
@@ -450,7 +496,13 @@ end
 -- ------------------------------------------------------------- lifecycle
 function Initialize()
   math.randomseed(os.time())
+  postSession = tostring(os.time()) .. tostring(math.random(100000, 999999))
   LoadDevices(true)
+  if ip() ~= '' and not normalizeAddress(ip()) then
+    SKIN:Bang('!SetVariable', 'IP', '')
+    SKIN:Bang('!WriteKeyValue Variables IP "" "#@#Variables.inc"')
+    showStatus('Saved address invalid; scanning...', true)
+  end
   if ip() == '' then StartScan() end
   for i = 1, 4 do setVar('TabC' .. i, i == page and ACC or OFFC) end
   layout()
@@ -492,19 +544,13 @@ function Update()
     reload = true
   end
 
-  if os.time() >= holdUntil then
-    s = changed('state', 'state.json')
-    if s then
-      local t = jdecode(s)
-      if t and t.state and t.state.seg then
-        S = t
-        reload = true
-      else
-        SetOffline()
-      end
-    end
-  end
   if reload and S then Render() end
+
+  pollPostResult()
+  if scanning and scanStarted and os.time() - scanStarted > 60 then
+    scanning = false
+    showStatus('Scan timed out - try again', true)
+  end
 
   if rbArm > 0 and os.time() - rbArm > 5 then
     rbArm = 0
@@ -514,28 +560,59 @@ function Update()
   return 0
 end
 
+function StateDownloaded()
+  if postInFlight or #postQueue > 0 then return end
+  local raw = dl('state.json')
+  if not raw or raw == '' or raw == lastRaw.state then return end
+  lastRaw.state = raw
+  local t = jdecode(raw)
+  if t and t.state and t.state.seg then
+    S = t
+    Render()
+  else
+    SetOffline()
+  end
+end
+
 function SetOffline()
   S = nil
+  postQueue = {}
   setVar('Name', 'Offline')
   setVar('Sub', ip() == '' and 'No device selected' or ('Cannot reach ' .. ip()))
   setVar('PowerCol', '70,70,90')
+  showStatus('Device unavailable', true)
   redraw()
 end
 
 -- ------------------------------------------------------------- devices
 function SetIP(addr)
-  addr = addr:gsub('^%s+', ''):gsub('%s+$', ''):gsub('^https?://', ''):gsub('/.*$', '')
+  local normalized = normalizeAddress(addr)
+  if not normalized then
+    showStatus('Enter a valid IPv4 address or hostname', true)
+    return false
+  end
+  addr = normalized
   SKIN:Bang('!SetVariable', 'IP', addr)
   SKIN:Bang('!WriteKeyValue Variables IP "' .. addr .. '" "#@#Variables.inc"')
+  S = nil
+  postQueue = {}
+  requestFailed = false
+  scanStatus = 'Connecting...'
+  setVar('StatusText', scanStatus)
   setVar('Name', 'Connecting...')
   setVar('Sub', addr)
   setVar('DevLabel', addr)
-  holdUntil = 0
   lastRaw = {}
   redraw(true)
   for _, mname in ipairs({ 'State', 'Eff', 'Pal', 'FxData', 'Presets' }) do
     SKIN:Bang('!CommandMeasure', mname, 'Update')
   end
+  return true
+end
+
+function SetIPFromInput()
+  local measure = SKIN:GetMeasure('InputIP')
+  SetIP(measure and measure:GetStringValue() or '')
 end
 
 function SelectDevice(i)
@@ -547,13 +624,28 @@ end
 function StepDevice(delta) SelectDevice(devIdx + delta) end
 
 function LoadDevices(quiet)
+  local scanWasStarted = scanStarted ~= nil
   scanning = false
+  scanStarted = nil
   devices = {}
   local s = readFile(SKIN:GetVariable('@') .. 'Devices.txt')
   if s then
     for line in s:gmatch('[^\r\n]+') do
       local addr, name = line:match('^(.-)|(.*)$')
       if addr then devices[#devices + 1] = { ip = addr, name = name ~= '' and name or 'WLED' } end
+    end
+  end
+  table.sort(devices, function(a, b) return a.ip < b.ip end)
+
+  if scanWasStarted then
+    local status = readFile(SKIN:GetVariable('@') .. 'ScanStatus.txt') or ''
+    local kind, message = status:match('^(%u+)|([^\r\n]+)')
+    if kind == 'ERROR' then
+      showStatus('Scan failed: ' .. message, true)
+    elseif kind == 'OK' then
+      showStatus(message, false)
+    else
+      showStatus('Scan finished', false)
     end
   end
 
@@ -574,32 +666,111 @@ end
 function StartScan()
   if scanning then return end
   scanning = true
+  scanStarted = os.time()
+  showStatus('Scanning local IPv4 networks...', false)
   refreshLabel()
   local at = SKIN:GetVariable('@')
-  SKIN:Bang('["powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' ..
+  SKIN:Bang('["wscript.exe" //B //NoLogo "' .. at .. 'RunHidden.vbs" "' ..
     at .. 'Scan.ps1" -Config "' .. SKIN:GetVariable('CURRENTCONFIG') ..
     '" -Rainmeter "' .. SKIN:GetVariable('PROGRAMPATH') .. 'Rainmeter.exe" -Out "' ..
-    at .. 'Devices.txt"]')
+    at .. 'Devices.txt" -Status "' .. at .. 'ScanStatus.txt"]')
 end
 
 -- ------------------------------------------------------------- sending
-local function post(json, hold)
-  if ip() == '' then return end
-  holdUntil = os.time() + (hold or 3)
-  postN = postN % 8 + 1
-  local path = SKIN:GetVariable('@') .. 'cmd' .. postN .. '.json'
-  local f = io.open(path, 'w')
-  if not f then return end
-  f:write(json)
-  f:close()
-  SKIN:Bang('["conhost.exe" --headless "curl.exe" -s -m 5 -H "Content-Type: application/json" -d "@' ..
-    path .. '" "http://' .. ip() .. '/json/state"]')
+refreshState = function()
+  lastRaw.state = nil
+  SKIN:Bang('!CommandMeasure', 'State', 'Update')
 end
 
-local function segPost(frag, hold)
+dispatchPost = function()
+  if postInFlight or #postQueue == 0 then return end
+  local request = table.remove(postQueue, 1)
+  if request.address ~= ip() then
+    return dispatchPost()
+  end
+
+  postSequence = postSequence + 1
+  local suffix = postSession .. '-' .. postSequence
+  local at = SKIN:GetVariable('@')
+  local payloadPath = at .. 'cmd-' .. suffix .. '.json'
+  local resultPath = at .. 'result-' .. suffix .. '.txt'
+  local f = io.open(payloadPath, 'w')
+  if not f then
+    postQueue = {}
+    requestFailed = true
+    showStatus('Command failed: cannot write request file', true)
+    refreshState()
+    return
+  end
+  f:write(request.json)
+  f:close()
+
+  postInFlight = {
+    address = request.address,
+    payloadPath = payloadPath,
+    resultPath = resultPath,
+    deadline = os.time() + 15,
+  }
+  local command = '["wscript.exe" //B //NoLogo "' .. at .. 'RunHidden.vbs" "' ..
+    at .. 'Post.ps1" -Address "' .. request.address .. '" -Payload "' .. payloadPath ..
+    '" -Result "' .. resultPath .. '"]'
+  SKIN:Bang(command)
+end
+
+pollPostResult = function()
+  if not postInFlight then return end
+  local request = postInFlight
+  local result = readFile(request.resultPath)
+  if (not result or result == '') and os.time() < request.deadline then return end
+  if not result or result == '' then result = 'ERROR|request timed out' end
+
+  postInFlight = nil
+  os.remove(request.payloadPath)
+  os.remove(request.resultPath)
+  local kind, message = result:match('^(%u+)|([^\r\n]+)')
+  if request.address == ip() then
+    if kind == 'OK' then
+      if #postQueue == 0 then
+        if not requestFailed then showStatus('Command accepted by WLED', false) end
+        refreshState()
+      else
+        showStatus('Sending queued commands...', false)
+        dispatchPost()
+      end
+    else
+      postQueue = {}
+      requestFailed = true
+      showStatus('Command failed: ' .. (message or 'unknown error'), true)
+      refreshState()
+    end
+  else
+    if #postQueue > 0 then dispatchPost() else refreshState() end
+  end
+end
+
+local function post(json)
+  local address = normalizeAddress(ip())
+  if not address then
+    showStatus('Choose a valid WLED address first', true)
+    return
+  end
+  if #postQueue >= MAX_QUEUED_POSTS then
+    postQueue = {}
+    requestFailed = true
+    showStatus('Command queue full - pending changes cancelled', true)
+    if not postInFlight then refreshState() end
+    return
+  end
+  postQueue[#postQueue + 1] = { address = address, json = json }
+  requestFailed = false
+  showStatus('Sending command...', false)
+  dispatchPost()
+end
+
+local function segPost(frag)
   local sg = seg()
   if not sg then return end
-  post('{"seg":[{"id":' .. (sg.id or 0) .. ',' .. frag .. '}]}', hold)
+  post('{"seg":[{"id":' .. (sg.id or 0) .. ',' .. frag .. '}]}')
 end
 
 local function colJson(sg)
@@ -653,11 +824,17 @@ function SetRGB(r, g, b)
 end
 
 function SetHex(hex)
+  if type(hex) ~= 'string' then return end
   hex = hex:gsub('#', '')
   if #hex == 6 and hex:match('^%x+$') then
     hsvMem = nil
     SetRGB(tonumber(hex:sub(1, 2), 16), tonumber(hex:sub(3, 4), 16), tonumber(hex:sub(5, 6), 16))
   end
+end
+
+function SetHexFromInput()
+  local measure = SKIN:GetMeasure('InputHex')
+  SetHex(measure and measure:GetStringValue() or '')
 end
 
 function SetColorStr(str)
@@ -723,8 +900,10 @@ end
 local function applyFx(i)
   local sg = seg()
   if not sg then return end
+  local m = meta(i)
   sg.fx = i
-  segPost('"fx":' .. i .. ',"fxdef":true', 1)
+  if m.defaultPal then sg.pal = m.defaultPal end
+  segPost('"fx":' .. i .. ',"fxdef":true')
   Render()
 end
 
@@ -863,7 +1042,7 @@ end
 local function applyPreset(id)
   if not S then return end
   S.state.ps = id
-  post('{"ps":' .. id .. '}', 2)
+  post('{"ps":' .. id .. '}')
   Render()
 end
 

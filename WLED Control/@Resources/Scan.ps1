@@ -1,39 +1,115 @@
 param(
+    [Parameter(Mandatory = $true)]
     [string]$Config,
+    [Parameter(Mandatory = $true)]
     [string]$Rainmeter,
-    [string]$Out
+    [Parameter(Mandatory = $true)]
+    [string]$Out,
+    [Parameter(Mandatory = $true)]
+    [string]$Status
 )
 
-# Scans every local IPv4 /24 for WLED devices (port 80, /json/info with brand WLED).
+$ErrorActionPreference = 'Stop'
 $found = @()
-try {
-    $subnets = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
-        Where-Object { $_.IPAddress -notmatch '^(127|169\.254)\.' -and $_.PrefixOrigin -ne 'WellKnown' } |
-        ForEach-Object { ($_.IPAddress -split '\.')[0..2] -join '.' } | Select-Object -Unique
+$message = ''
+$kind = 'ERROR'
 
-    foreach ($net in $subnets) {
+function ConvertTo-IPv4Number([string]$Address) {
+    $octets = $Address.Split('.') | ForEach-Object { [uint64]::Parse($_) }
+    return [uint64]($octets[0] * 16777216 + $octets[1] * 65536 + $octets[2] * 256 + $octets[3])
+}
+
+function ConvertFrom-IPv4Number([uint64]$Number) {
+    $a = [math]::Floor($Number / 16777216) % 256
+    $b = [math]::Floor($Number / 65536) % 256
+    $c = [math]::Floor($Number / 256) % 256
+    $d = $Number % 256
+    return "$a.$b.$c.$d"
+}
+
+try {
+    $connectedIfIndexes = @{}
+    Get-NetIPInterface -AddressFamily IPv4 -ErrorAction Stop |
+        Where-Object { $_.ConnectionState -eq 'Connected' } |
+        ForEach-Object { $connectedIfIndexes[[int]$_.InterfaceIndex] = $true }
+
+    $networks = @{}
+    Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+        Where-Object {
+            $connectedIfIndexes.ContainsKey([int]$_.InterfaceIndex) -and
+            $_.IPAddress -notmatch '^(127|169\.254|0)\.' -and
+            $_.PrefixLength -ge 22 -and $_.PrefixLength -le 30
+        } |
+        ForEach-Object {
+            $size = [uint64][math]::Pow(2, 32 - [int]$_.PrefixLength)
+            $addressNumber = ConvertTo-IPv4Number $_.IPAddress
+            $networkNumber = [uint64]([math]::Floor($addressNumber / $size) * $size)
+            $networkKey = "$networkNumber/$($_.PrefixLength)"
+            if (-not $networks.ContainsKey($networkKey)) {
+                $networks[$networkKey] = @{
+                    First = $networkNumber + 1
+                    Last = $networkNumber + $size - 2
+                }
+            }
+        }
+
+    if ($networks.Count -eq 0) {
+        throw 'No connected IPv4 subnet with 2-1022 host addresses was found'
+    }
+
+    foreach ($network in $networks.Values) {
         $clients = @{}
         $tasks = @()
-        foreach ($i in 1..254) {
-            $ip = "$net.$i"
-            $c = New-Object System.Net.Sockets.TcpClient
-            $clients[$ip] = $c
-            $tasks += $c.ConnectAsync($ip, 80)
-        }
-        try { [void][System.Threading.Tasks.Task]::WaitAll($tasks, 2000) } catch {}
+        try {
+            for ($number = $network.First; $number -le $network.Last; $number++) {
+                $candidate = ConvertFrom-IPv4Number $number
+                $client = New-Object System.Net.Sockets.TcpClient
+                $clients[$candidate] = $client
+                try {
+                    $tasks += $client.ConnectAsync($candidate, 80)
+                } catch {
+                    $client.Close()
+                }
+            }
+            if ($tasks.Count -gt 0) {
+                try { [void][System.Threading.Tasks.Task]::WaitAll($tasks, 1500) } catch {}
+            }
 
-        foreach ($ip in $clients.Keys) {
-            if (-not $clients[$ip].Connected) { continue }
-            try {
-                $info = Invoke-RestMethod -Uri "http://$ip/json/info" -TimeoutSec 2
-                if ($info.brand -eq 'WLED') { $found += "$ip|$($info.name)" }
-            } catch {}
+            foreach ($candidate in $clients.Keys) {
+                if (-not $clients[$candidate].Connected) { continue }
+                try {
+                    $info = Invoke-RestMethod -Uri "http://$candidate/json/info" -TimeoutSec 2
+                    if ($info.brand -eq 'WLED') {
+                        $name = ([string]$info.name) -replace '[\r\n]', ' '
+                        $found += "$candidate|$name"
+                    }
+                } catch {
+                    # Open port 80 with a non-WLED response is expected during discovery.
+                }
+            }
+        } finally {
+            foreach ($client in $clients.Values) { $client.Close() }
         }
-        foreach ($c in $clients.Values) { $c.Close() }
     }
-} catch {}
 
-[System.IO.File]::WriteAllLines($Out, [string[]]$found)
+    $found = @($found | Sort-Object { [version]($_.Split('|')[0]) })
+    $kind = 'OK'
+    if ($found.Count -eq 0) {
+        $message = 'No WLED devices found on connected local networks'
+    } else {
+        $message = "Found $($found.Count) WLED device(s)"
+    }
+} catch {
+    $found = @()
+    $message = $_.Exception.Message -replace '[\r\n|]', ' '
+}
 
-$args2 = "!CommandMeasure Script `"LoadDevices()`" `"$Config`""
-Start-Process -FilePath $Rainmeter -ArgumentList $args2
+$outTemp = "$Out.tmp"
+$statusTemp = "$Status.tmp"
+[System.IO.File]::WriteAllLines($outTemp, [string[]]$found, [System.Text.Encoding]::ASCII)
+[System.IO.File]::WriteAllText($statusTemp, "$kind|$message", [System.Text.Encoding]::ASCII)
+Move-Item -LiteralPath $outTemp -Destination $Out -Force
+Move-Item -LiteralPath $statusTemp -Destination $Status -Force
+
+$arguments = "!CommandMeasure Script `"LoadDevices()`" `"$Config`""
+Start-Process -FilePath $Rainmeter -ArgumentList $arguments
